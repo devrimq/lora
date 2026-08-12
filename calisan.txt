@@ -1,0 +1,82 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <RadioLib.h>
+
+// ============================================================
+// KAYNAK: meshtastic/firmware
+//   variants/esp32s3/seeed_xiao_s3/variant.h
+// Bu pinler Meshtastic'in resmi, ÇALIŞAN firmware'inden alınmıştır.
+// Eski kodumuzdaki "D0/D1/D2/D3" varsayımı bu karta ait DEĞİLDİ.
+// ============================================================
+
+#define RADIO_NSS   41  // LORA_CS
+#define RADIO_RST   42  // LORA_RESET
+#define RADIO_BUSY  40  // SX126X_BUSY
+#define RADIO_DIO1  39  // LORA_DIO1
+
+// Donanımsal SPI pinleri (bunlar zaten doğruydu)
+#define SPI_SCK     7
+#define SPI_MISO    8
+#define SPI_MOSI    9
+
+SX1262 radio = new Module(RADIO_NSS, RADIO_DIO1, RADIO_RST, RADIO_BUSY);
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
+  delay(2000);
+
+  Serial.println("\n--- LoRa Modul Testi (Meshtastic pin haritasi) ---");
+
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
+
+  // Meshtastic'te DIO2, RF anten anahtari olarak kullaniliyor
+  radio.setDio2AsRfSwitch(true);
+
+  Serial.print("Modul baslatiliyor (868.0 MHz, TCXO 1.8V)... ");
+
+  // Meshtastic sabit 1.8V TCXO kullaniyor -> begin() icinde belirtiyoruz
+  int state = radio.begin(
+    868.0,                              // Frekans (bolgene gore 915.0 da olabilir)
+    125.0,                              // Bant genisligi
+    9,                                  // Spreading factor
+    7,                                  // Coding rate
+    RADIOLIB_SX126X_SYNC_WORD_PRIVATE,  // Sync word
+    10,                                 // TX gucu (dBm)
+    8,                                  // Preamble uzunlugu
+    1.8,                                // TCXO voltaji (Meshtastic'teki sabit deger)
+    false                               // useRegulatorLDO -> false = DC-DC (Meshtastic varsayimi)
+  );
+
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("BASARILI!");
+    Serial.println("Modul lora iletisimine hazir hale getirildi.");
+  } else {
+    Serial.print("HATA! Kod: ");
+    Serial.println(state);
+    Serial.println("Hala basarisizsa: B2B konnektorun tam oturdugundan");
+    Serial.println("ve antenin takili oldugundan emin ol (antensiz TX bazen");
+    Serial.println("modulu koruma moduna sokabilir).");
+  }
+}
+
+void loop() {
+  delay(1000);
+}
+
+
+
+
+
+
+
+
+
+
+[env:seeed_xiao_esp32s3]
+platform = espressif32
+board = seeed_xiao_esp32s3
+framework = arduino
+monitor_speed = 115200
+lib_deps = 
+    jgromes/RadioLib @ 6.6.0
