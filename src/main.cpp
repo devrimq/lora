@@ -10,17 +10,17 @@
 // =================================================================
 // DONANIM PİNLERİ VE TANIMLAR
 // =================================================================
-#define DEVICE_NAME "LoRa-1"
+#define DEVICE_NAME "LoRa-1" // 2. cihaz için "LoRa-2" yapın
 
 #define I2C_SDA 5
 #define I2C_SCL 6
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 #define BTN_PIN GPIO_NUM_21
-#define SHORT_PRESS_MAX 1000  // Uyanıkken menü geçişi (< 1.0 sn)
-#define SEND_PRESS_MIN  1500  // Uyanıkken mesaj gönderme (~1.5 sn)
-#define WAKE_PRESS_MIN  1200  // Uyurken uyanma eşiği (1.2 - 2.0 sn)
-#define IDLE_SLEEP_TIMEOUT 60000UL // 1 dakika (60000 ms)
+#define SHORT_PRESS_MAX 1500  // SEND_PRESS_MIN ile ayni deger: aralarinda "olu bolge" kalmasin
+#define SEND_PRESS_MIN  1500  
+#define WAKE_PRESS_MIN  1200  
+#define IDLE_SLEEP_TIMEOUT 150000UL // 2.5 Dakika (150 sn)
 
 #define LORA_NSS  41
 #define LORA_DIO1 39
@@ -49,6 +49,21 @@ volatile bool blePending = false;
 volatile bool bleIsCustom = false;
 volatile uint8_t bleRequestedID = 0;
 char bleCustomText[BLE_CUSTOM_TEXT_MAX];
+
+// =================================================================
+// KESME (INTERRUPT) BAYRAĞI
+// =================================================================
+volatile bool packetReceived = false;
+volatile bool radioReady = false; // radio.begin() basarili oldu mu?
+
+#if defined(ESP32)
+  IRAM_ATTR
+#elif defined(ESP8266)
+  ICACHE_RAM_ATTR
+#endif
+void setFlag(void) {
+  packetReceived = true;
+}
 
 // =================================================================
 // MESAJ VE SİSTEM DURUM DEĞİŞKENLERİ
@@ -84,6 +99,7 @@ QueuedMessage messageQueue[QUEUE_SIZE];
 
 String lastRxMsg = "";
 float lastRxRSSI = 0;
+float lastRxSNR = 0;
 bool screenNeedsUpdate = true;
 bool isSleeping = false;
 unsigned long lastActivityTime = 0;
@@ -126,6 +142,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
     bleConnected = false;
     screenNeedsUpdate = true;
+    // Uzun bir BLE oturumu boyunca lastActivityTime guncellenmemis olabilir;
+    // baglanti koptugu anda sayaci sifirliyoruz ki cihaz aniden (bekleme
+    // suresi zaten dolmus gibi) uykuya dalmasin.
+    markActivity();
     NimBLEDevice::startAdvertising();
   }
 };
@@ -155,58 +175,75 @@ class WriteCallback : public NimBLECharacteristicCallbacks {
 // LIGHT SLEEP YÖNETİMİ
 // =================================================================
 void enterLightSleep() {
-  u8g2.setPowerSave(1); // Ekranı kapat
+  u8g2.setPowerSave(1);
   isSleeping = true;
 
-  // Wakeup Kaynakları Hazırlığı
+  // ONEMLI: RadioLib, setPacketReceivedAction() ile DIO1 pinine RISING-EDGE
+  // tipinde bir donanim kesmesi (attachInterrupt) baglamis durumda. Asagida
+  // gpio_wakeup_enable() ayni pin icin HIGH-LEVEL tipinde bir kesme tipi
+  // ayarliyor. Ikisi AYNI GPIO kesme-tipi yazmacini kullaniyor; bu yuzden
+  // gpio_wakeup_enable RadioLib'in RISING-EDGE ayarini sessizce LEVEL'e
+  // cevirir. Uyanip normal moda donuldugunde bu deger geri RISING'e
+  // dondurulmezse, DIO1 hattinin sonraki bir RX olayinda kisa sure HIGH'da
+  // kalmasi (radyo tarafindan temizlenene kadar) LEVEL-triggered kesmeyi
+  // surekli yeniden tetikleyip bir "interrupt storm" olusturuyor ve bu da
+  // "Interrupt wdt timeout" panigine yol aciyor. Cozum: uykuya girmeden
+  // once RadioLib'in kesmesini gecici olarak kaldiriyoruz, uyandiktan sonra
+  // da (asagida, fonksiyon sonunda) dogru RISING-EDGE moduna geri donduruyoruz.
+  if (radioReady) {
+    radio.clearPacketReceivedAction();
+  }
+
   gpio_wakeup_enable(BTN_PIN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)LORA_DIO1, GPIO_INTR_HIGH_LEVEL);
+  if (radioReady) {
+    gpio_wakeup_enable((gpio_num_t)LORA_DIO1, GPIO_INTR_HIGH_LEVEL);
+  }
   esp_sleep_enable_gpio_wakeup();
 
   while (isSleeping) {
     esp_light_sleep_start();
 
-    // Uyanma Sonrası Kontroller
-    // 1. Uyanma Nedeni: LoRa'dan Mesaj Gelmesi
-    if (digitalRead(LORA_DIO1) == HIGH) {
+    // 1. LoRa'dan Mesaj Geldi
+    if (radioReady && digitalRead(LORA_DIO1) == HIGH) {
       String rxStr;
       if (radio.readData(rxStr) == RADIOLIB_ERR_NONE) {
         handleIncomingPacket(rxStr);
       }
       radio.startReceive();
-      isSleeping = false; // Cihaz tamamen uyanır
+      isSleeping = false;
       u8g2.setPowerSave(0);
       markActivity();
       screenNeedsUpdate = true;
       break;
     }
 
-    // 2. Uyanma Nedeni: Butona Basılması
+    // 2. Butona Basıldı
     if (digitalRead(BTN_PIN) == LOW) {
       unsigned long pressStart = millis();
-      // Buton bırakılana kadar süreyi ölç
       while (digitalRead(BTN_PIN) == LOW) {
         delay(10);
       }
       unsigned long pressDuration = millis() - pressStart;
 
       if (pressDuration >= WAKE_PRESS_MIN) {
-        // ~1.2 - 2.0 sn basıldı: Geçerli uyanma
         isSleeping = false;
         u8g2.setPowerSave(0);
         markActivity();
         screenNeedsUpdate = true;
         break;
       } else {
-        // < 1.2 sn basıldı: Yanlışlıkla basma, tekrar uykudayız
-        // Ekran açılmaz, döngü devam eder ve tekrar light sleep'e girer
-        delay(50); // Debounce
+        delay(50);
       }
     }
   }
   
   gpio_wakeup_disable(BTN_PIN);
-  gpio_wakeup_disable((gpio_num_t)LORA_DIO1);
+  if (radioReady) {
+    gpio_wakeup_disable((gpio_num_t)LORA_DIO1);
+    // DIO1 kesme tipini gpio_wakeup_enable'in LEVEL moduna cevirmesinden once
+    // oldugu gibi RISING-EDGE'e geri donduruyoruz - "interrupt storm" fixi.
+    radio.setPacketReceivedAction(setFlag);
+  }
 }
 
 // =================================================================
@@ -225,12 +262,43 @@ void setup() {
   // SPI ve LoRa Kurulumu
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
   radio.setDio2AsRfSwitch(true);
-  radio.begin(868.0);
-  radio.setTCXO(1.6);
-  radio.startReceive();
+  
+  // 868MHz, 125kHz, SF9, CR 4/7, Private SyncWord, 14dBm, Preamble 8, TCXO 1.8V, DC-DC
+  // ONEMLI: TCXO gerilimi kasitli olarak 1.8V'a sabitlendi. Onceki test firmware'inde
+  // (calisan.txt / Meshtastic referansi) bu deger 1.8V idi; 1.6V ile bu karttaki TCXO
+  // stabil calismiyor ve TX guvenilirligini dusuruyor. Bu satiri geri 1.6V yapmayin.
+  int state = RADIOLIB_ERR_UNKNOWN;
+  for (uint8_t attempt = 0; attempt < 3 && state != RADIOLIB_ERR_NONE; attempt++) {
+    state = radio.begin(868.0, 125.0, 9, 7, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, 14, 8, 1.8, false);
+    if (state != RADIOLIB_ERR_NONE) {
+      Serial.printf("[LoRa] Baslatma denemesi %d basarisiz, kod: %d\n", attempt + 1, state);
+      delay(300);
+    }
+  }
+
+  radioReady = (state == RADIOLIB_ERR_NONE);
+  if (radioReady) {
+    Serial.println("[LoRa] Basariyla baslatildi.");
+    radio.setPacketReceivedAction(setFlag);
+    radio.startReceive();
+  } else {
+    Serial.printf("[LoRa] KRITIK HATA - LoRa baslatilamadi: %d\n", state);
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 15, "LORA MODUL HATASI!");
+    u8g2.setCursor(0, 32);
+    u8g2.printf("Hata kodu: %d", state);
+    u8g2.drawStr(0, 48, "Anten/B2B baglantisini");
+    u8g2.drawStr(0, 60, "kontrol edip resetleyin");
+    u8g2.sendBuffer();
+    delay(3000);
+  }
 
   // BLE Kurulumu
   NimBLEDevice::init(DEVICE_NAME);
+  // Varsayilan BLE MTU (23 bayt, ~20 bayt kullanilabilir) ozel mesaj (34 bayt) icin
+  // yetersiz kalabilir; MTU'yu yukseltiyoruz (telefon tarafi da negotiate etmeli).
+  NimBLEDevice::setMTU(185);
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
@@ -254,9 +322,11 @@ void setup() {
 
 void loop() {
   // LoRa Paketi Dinleme (Uyanık Modda)
-  if (digitalRead(LORA_DIO1) == HIGH) {
+  if (radioReady && packetReceived) {
+    packetReceived = false;
     String rxStr;
-    if (radio.readData(rxStr) == RADIOLIB_ERR_NONE) {
+    int state = radio.readData(rxStr);
+    if (state == RADIOLIB_ERR_NONE) {
       handleIncomingPacket(rxStr);
       markActivity();
     }
@@ -269,6 +339,7 @@ void loop() {
     const char *pendingText = (pendingAckID == 0) ? nullptr : getMessageText(pendingAckID);
     if (pendingText != nullptr) addToQueue(pendingAckID, pendingText);
     screenNeedsUpdate = true;
+    if (radioReady) radio.startReceive();
   }
 
   // BLE Mesaj İstekleri
@@ -301,13 +372,19 @@ void loop() {
     btnPressStart = millis();
   } else if (lastState == LOW && currentState == HIGH) {
     unsigned long duration = millis() - btnPressStart;
-    if (duration > 50) { // Debounce
+    if (duration > 50) {
       markActivity();
+      // NOT: Eskiden 3.5 sn+ basili tutma "Yardim Gerekli!" mesajini
+      // otomatik gonderiyordu. Bu, cepte/cantada kazara uzun sure basili
+      // kalma ihtimaliyle YANLIS ALARM riski tasidigi icin kaldirildi.
+      // "Yardim Gerekli!" mesaji zaten menude (4. sirada) mevcut; kullanici
+      // bilinçli olarak secip normal gonderim basisiyla (>=SEND_PRESS_MIN)
+      // yollayabilir.
       if (duration >= SEND_PRESS_MIN) {
-        // ~1.5 sn basılı tutma -> Gönder
+        // ~1.5 sn basılı tutma -> Seçili Mesajı Gönder
         sendMessage(predefinedMessages[currentIndex].id);
       } else if (duration < SHORT_PRESS_MAX) {
-        // Kısa basış (< 1 sn) -> Menüde gez
+        // Kısa basış -> Menüde gez
         currentIndex = (currentIndex + 1) % totalMessages;
         screenNeedsUpdate = true;
       }
@@ -328,8 +405,11 @@ void loop() {
     screenNeedsUpdate = false;
   }
 
-  // 1 Dakika Hareketsizlik Kontrolü -> Light Sleep Moduna Geçiş
-  if (millis() - lastActivityTime > IDLE_SLEEP_TIMEOUT) {
+  // 2.5 Dakika Hareketsizlik Kontrolü -> Light Sleep Moduna Geçiş
+  // ONEMLI: BLE baglantisi acikken uykuya dalmiyoruz. Aksi halde telefon
+  // uzerinden ozel mesaj yazarken cihaz esp_light_sleep_start() ile CPU'yu
+  // durdurur, BLE baglantisi kopar/kararsizlasir ve yazilan mesaj gidemez.
+  if (!bleConnected && (millis() - lastActivityTime > IDLE_SLEEP_TIMEOUT)) {
     enterLightSleep();
   }
 }
@@ -340,6 +420,13 @@ void loop() {
 void sendMessage(uint8_t messageID) {
   const char *text = getMessageText(messageID);
   if (text == nullptr) return;
+
+  if (!radioReady) {
+    addToQueue(messageID, text);
+    updateScreen("LORA HATALI - KUYRUGA EKLENDI");
+    screenNeedsUpdate = true;
+    return;
+  }
 
   char payload[40];
   snprintf(payload, sizeof(payload), "MSG:%d:%s", messageID, text);
@@ -357,13 +444,19 @@ void sendMessage(uint8_t messageID) {
     updateScreen("HATA - KUYRUGA EKLENDI");
   }
 
-  delay(200);
   radio.startReceive();
   screenNeedsUpdate = true;
 }
 
 void sendCustomMessage(const String &text) {
   if (text.length() == 0) return;
+
+  if (!radioReady) {
+    addToQueue(0, text.c_str());
+    updateScreen("LORA HATALI - KUYRUGA EKLENDI");
+    screenNeedsUpdate = true;
+    return;
+  }
 
   char payload[40];
   snprintf(payload, sizeof(payload), "MSG:0:%s", text.c_str());
@@ -381,13 +474,36 @@ void sendCustomMessage(const String &text) {
     updateScreen("HATA - KUYRUGA EKLENDI");
   }
 
-  delay(200);
   radio.startReceive();
   screenNeedsUpdate = true;
 }
 
+int16_t lastTxState = RADIOLIB_ERR_NONE; // son transmit() donus kodu - hata ayiklama icin
+
 bool transmitPacket(const char *payload) {
-  return (radio.transmit(payload) == RADIOLIB_ERR_NONE);
+  if (!radioReady) return false;
+
+  // ONEMLI: setPacketReceivedAction() ile DIO1'e baglanan kesme sadece
+  // "RX Done" degil, pindeki HER YUKSELEN KENAR icin tetikleniyor. Bu da
+  // radio.transmit() bittiginde olusan "TX Done" kenarini da RX sanip
+  // packetReceived=true yapiyor. Bir sonraki loop() turunde readData()
+  // cagirilinca, SX126x TX/RX icin ayni dahili tamponu kullandigindan,
+  // henuz gercek bir paket gelmemisken kendi az once gonderdigimiz baytlar
+  // geri okunuyor -> cihaz "kendi mesajini almis gibi" davraniyordu.
+  // Cozum: transmit() suresince RX-done kesmesini gecici olarak kaldirip,
+  // bittikten sonra temiz bir sekilde yeniden takiyoruz.
+  radio.clearPacketReceivedAction();
+  packetReceived = false;
+
+  lastTxState = radio.transmit(payload);
+  if (lastTxState != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] TX hatasi, kod: %d\n", lastTxState);
+  }
+
+  packetReceived = false; // TX Done kenarinin tetiklemis olabilecegi bayragi temizle
+  radio.setPacketReceivedAction(setFlag);
+
+  return (lastTxState == RADIOLIB_ERR_NONE);
 }
 
 bool addToQueue(uint8_t messageID, const char *text) {
@@ -407,7 +523,7 @@ bool addToQueue(uint8_t messageID, const char *text) {
 }
 
 void processQueue() {
-  if (waitingForAck) return;
+  if (waitingForAck || !radioReady) return;
 
   for (int i = 0; i < QUEUE_SIZE; i++) {
     if (messageQueue[i].used && (millis() - messageQueue[i].lastAttempt >= RETRY_INTERVAL)) {
@@ -446,23 +562,31 @@ void handleIncomingPacket(String &packet) {
       }
       screenNeedsUpdate = true;
     }
+    radio.startReceive();
     return;
   }
 
   if (packet.startsWith("MSG:")) {
     int firstColon = packet.indexOf(':', 4);
-    if (firstColon < 0) return;
+    if (firstColon < 0) {
+      radio.startReceive();
+      return;
+    }
 
     int msgID = packet.substring(4, firstColon).toInt();
     String msgText = packet.substring(firstColon + 1);
 
     lastRxMsg = msgText;
     lastRxRSSI = radio.getRSSI();
+    lastRxSNR = radio.getSNR();
     screenNeedsUpdate = true;
 
+    delay(50);
     char ackPayload[16];
     snprintf(ackPayload, sizeof(ackPayload), "ACK:%d", msgID);
     transmitPacket(ackPayload);
+
+    radio.startReceive();
 
     if (bleConnected && pNotifyChar) {
       String notifyPayload = "RX:" + msgText;
@@ -478,19 +602,18 @@ void updateScreen(const char *systemStatus) {
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.drawStr(0, 10, "ALINAN (RX):");
 
-  u8g2.setCursor(0, 23);
+  u8g2.setCursor(0, 22);
   if (lastRxMsg == "") {
     u8g2.print("[Henuz Mesaj Yok]");
   } else {
     u8g2.print("<- ");
     u8g2.print(lastRxMsg);
     u8g2.setFont(u8g2_font_u8glib_4_tf);
-    u8g2.print(" (");
-    u8g2.print((int)lastRxRSSI);
-    u8g2.print("dB)");
+    u8g2.setCursor(0, 27);
+    u8g2.printf("RSSI: %d dBm | SNR: %.1f dB", (int)lastRxRSSI, lastRxSNR);
   }
 
-  u8g2.drawHLine(0, 28, 128);
+  u8g2.drawHLine(0, 29, 128);
 
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.drawStr(0, 42, "SECILEN (TX):");
@@ -514,7 +637,7 @@ void updateScreen(const char *systemStatus) {
   if (systemStatus != nullptr && strlen(systemStatus) > 0) {
     u8g2.drawStr(0, 63, systemStatus);
   } else {
-    u8g2.drawStr(0, 63, "[Gez: <1s | Gonder: 1.5s]");
+    u8g2.drawStr(0, 63, "[Gez:<1s|Gnd:1.5s|Acil:>3.5s]");
   }
 
   u8g2.sendBuffer();
